@@ -9,7 +9,9 @@ from query_analyzer import analyze_query
 # CONFIGURATION
 # --------------------------------------------------
 
-RELEVANCE_THRESHOLD = 1.40
+# Embeddings are L2-normalized.  The previous ChromaDB squared-L2 threshold
+# of 1.40 is equivalent to a cosine distance threshold of 0.70.
+RELEVANCE_THRESHOLD = 0.70
 
 
 # --------------------------------------------------
@@ -175,7 +177,8 @@ def retrieve_comparison(
 def retrieve_global(
     collection,
     question,
-    n_results=20
+    n_results=20,
+    attribute=None
 ):
     """
     Retrieve all bike records for global/aggregate
@@ -189,7 +192,83 @@ def retrieve_global(
         include=["documents", "metadatas"]
     )
 
-    return results
+    if not attribute:
+        return results
+
+    attribute_terms = re.findall(
+        r"[a-z0-9]+",
+        ATTRIBUTE_QUERIES.get(attribute, "").lower()
+    )
+
+    if not attribute_terms:
+        return results
+
+    label_pattern = re.compile(
+        r"^\s*"
+        + r"\s*[\W_]*\s*".join(
+            re.escape(term) for term in attribute_terms
+        )
+        + r"\b(?P<remainder>.*)$",
+        re.IGNORECASE
+    )
+
+    compact_documents = []
+    compact_metadatas = []
+    documents = results.get("documents") or []
+    metadatas = results.get("metadatas") or []
+
+    for index, document in enumerate(documents):
+        if not isinstance(document, str):
+            continue
+
+        lines = document.splitlines()
+
+        for line_index, line in enumerate(lines):
+            label_match = label_pattern.match(line)
+
+            if not label_match:
+                continue
+
+            value = label_match.group("remainder").strip(" :–—-")
+
+            if value.startswith("(") and ")" in value:
+                value = value.partition(")")[2].strip(" :–—-")
+
+            # Most records place values on the following line.  Some place
+            # them after the label, e.g. "Seat height: 825 mm".
+            if not value:
+                value = next(
+                    (
+                        candidate.strip()
+                        for candidate in lines[line_index + 1:]
+                        if candidate.strip()
+                    ),
+                    None
+                )
+
+            if value:
+                compact_documents.append(
+                    f"{line.strip()}\n{value}"
+                )
+                compact_metadatas.append(
+                    metadatas[index]
+                    if index < len(metadatas)
+                    else {}
+                )
+
+            break
+
+    # Never perform a global comparison on a partial attribute set.  If a
+    # document uses an unsupported label format, retain the existing complete
+    # GLOBAL context instead of silently excluding that bike.
+    if len(compact_documents) != len(documents):
+        return results
+
+    return {
+        "documents": compact_documents,
+        "metadatas": compact_metadatas,
+    }
+
 
 
 # --------------------------------------------------
@@ -403,7 +482,8 @@ def retrieve(
             retrieve_global(
                 collection=collection,
                 question=query,
-                n_results=20
+                n_results=20,
+                attribute=attribute
             )
         ]
 
@@ -443,191 +523,103 @@ def retrieve(
 # FORMAT RETRIEVED CONTEXT
 # --------------------------------------------------
 
+def _normalize_chroma_records(documents, metadatas):
+    """Normalize ChromaDB query and get result shapes into parallel lists."""
+
+    # query() returns list[list[str]], whereas get() returns list[str].
+    if isinstance(documents, str):
+        document_list = [documents]
+    elif isinstance(documents, list):
+        document_list = (
+            documents[0]
+            if documents and isinstance(documents[0], list)
+            else documents
+        )
+    else:
+        document_list = []
+
+    if isinstance(metadatas, dict):
+        metadata_list = [metadatas] * len(document_list)
+    elif isinstance(metadatas, list):
+        metadata_list = (
+            metadatas[0]
+            if metadatas and isinstance(metadatas[0], list)
+            else metadatas
+        )
+    else:
+        metadata_list = []
+
+    return document_list, metadata_list
+
+
 def format_context(results):
-    """
-    Convert retrieval results into clean textual
-    context for the LLM.
-    """
+    """Convert retrieval results into clean textual context for the LLM."""
 
     context_parts = []
+
+    def add_source(document, metadata, bike_override=None):
+        if not isinstance(document, str):
+            return
+
+        metadata = metadata if isinstance(metadata, dict) else {}
+        bike = bike_override or metadata.get("bike", "Unknown")
+        page = metadata.get("page", "Unknown")
+
+        context_parts.append(
+            f"""
+--- SOURCE ---
+Bike: {bike}
+Page: {page}
+
+{document}
+"""
+        )
 
     for result_group in results:
 
         if not isinstance(result_group, dict):
             continue
 
-        # ------------------------------------------
-        # CATEGORY RESULT
-        #
-        # {
-        #     "document": "...",
-        #     "metadata": {...}
-        # }
-        # ------------------------------------------
-
+        # CATEGORY retrieval returns one document/metadata pair per match.
         if "document" in result_group:
-
-            document = result_group.get(
-                "document",
-                ""
+            add_source(
+                result_group.get("document", ""),
+                result_group.get("metadata", {})
             )
-
-            metadata = result_group.get(
-                "metadata",
-                {}
-            )
-
-            bike = metadata.get(
-                "bike",
-                "Unknown"
-            )
-
-            page = metadata.get(
-                "page",
-                "Unknown"
-            )
-
-            context_parts.append(
-                f"""
---- SOURCE ---
-Bike: {bike}
-Page: {page}
-
-{document}
-"""
-            )
-
             continue
 
-        # ------------------------------------------
-        # NORMAL CHROMADB RESULT
-        #
-        # {
-        #     "documents": [...],
-        #     "metadatas": [...]
-        # }
-        # ------------------------------------------
-
-        if "documents" in result_group:
-
-            documents = result_group.get(
-                "documents"
-            ) or [[]]
-
-            metadatas = result_group.get(
-                "metadatas"
-            ) or [[]]
-
-            documents = documents[0] if documents else []
-            metadatas = metadatas[0] if metadatas else []
-
-            # --------------------------------------
-            # IMPORTANT:
-            # ChromaDB metadata can sometimes
-            # behave like a dictionary rather than
-            # a list depending on the returned
-            # structure.
-            # --------------------------------------
-
-            if isinstance(metadatas, dict):
-                metadata_list = [
-                    metadatas
-                ] * len(documents)
-            else:
-                metadata_list = metadatas
-
-            for i, document in enumerate(documents):
-
-                metadata = (
-                    metadata_list[i]
-                    if i < len(metadata_list)
-                    and isinstance(metadata_list[i], dict)
-                    else {}
-                )
-
-                bike = metadata.get(
-                    "bike",
-                    "Unknown"
-                )
-
-                page = metadata.get(
-                    "page",
-                    "Unknown"
-                )
-
-                context_parts.append(
-                    f"""
---- SOURCE ---
-Bike: {bike}
-Page: {page}
-
-{document}
-"""
-                )
-
-            continue
-
-        # ------------------------------------------
-        # COMPARISON RESULT
-        #
-        # {
-        #     "bike": "Himalayan 450",
-        #     "results": {...}
-        # }
-        # ------------------------------------------
-
+        # COMPARISON retrieval wraps one normal ChromaDB query result per bike.
         if "results" in result_group:
-
-            bike = result_group.get(
-                "bike",
-                "Unknown"
+            nested_results = result_group.get("results", {})
+            documents, metadatas = _normalize_chroma_records(
+                nested_results.get("documents"),
+                nested_results.get("metadatas")
             )
 
-            nested_results = result_group.get(
-                "results",
-                {}
-            )
-
-            documents = nested_results.get(
-                "documents"
-            ) or [[]]
-
-            metadatas = nested_results.get(
-                "metadatas"
-            ) or [[]]
-
-            documents = documents[0] if documents else []
-            metadatas = metadatas[0] if metadatas else []
-
-            if isinstance(metadatas, dict):
-                metadata_list = [
-                    metadatas
-                ] * len(documents)
-            else:
-                metadata_list = metadatas
-
-            for i, document in enumerate(documents):
-
+            for index, document in enumerate(documents):
                 metadata = (
-                    metadata_list[i]
-                    if i < len(metadata_list)
-                    and isinstance(metadata_list[i], dict)
+                    metadatas[index]
+                    if index < len(metadatas)
                     else {}
                 )
+                add_source(document, metadata, result_group.get("bike"))
 
-                page = metadata.get(
-                    "page",
-                    "Unknown"
+            continue
+
+        # ENTITY and GENERAL retrieval use query() (nested lists); GLOBAL
+        # retrieval uses get() (flat lists). Both are normalized above.
+        if "documents" in result_group:
+            documents, metadatas = _normalize_chroma_records(
+                result_group.get("documents"),
+                result_group.get("metadatas")
+            )
+
+            for index, document in enumerate(documents):
+                metadata = (
+                    metadatas[index]
+                    if index < len(metadatas)
+                    else {}
                 )
-
-                context_parts.append(
-                    f"""
---- SOURCE ---
-Bike: {bike}
-Page: {page}
-
-{document}
-"""
-                )
+                add_source(document, metadata)
 
     return "\n".join(context_parts)

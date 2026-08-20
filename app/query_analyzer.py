@@ -242,6 +242,7 @@ MAX_WORDS = [
     "most",
     "fastest",
     "heaviest",
+    "tallest"
 ]
 
 

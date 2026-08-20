@@ -1,41 +1,24 @@
 from query_analyzer import analyze_query
+from query_normalizer import normalize_question
 from retriever import retrieve, format_context
-from llm import generate_answer
 
 
-# --------------------------------------------------
-# TEST QUESTION
-# --------------------------------------------------
-
-question = "what is the capital of india?"
+DEBUG_SEPARATOR = "=" * 50
+DEBUG = False
 
 
-# --------------------------------------------------
-# STEP 1: ANALYZE QUERY
-# --------------------------------------------------
+def print_debug(title: str, value):
+    if not DEBUG:
+        return
 
-analysis = analyze_query(question)
-
-
-# --------------------------------------------------
-# STEP 2: RETRIEVE RELEVANT DOCUMENTS
-# --------------------------------------------------
-
-results = retrieve(question)
+    print("\n" + DEBUG_SEPARATOR)
+    print(title)
+    print(DEBUG_SEPARATOR)
+    print(value)
 
 
-# --------------------------------------------------
-# STEP 3: FORMAT RETRIEVED CONTEXT
-# --------------------------------------------------
-
-context = format_context(results)
-
-
-# --------------------------------------------------
-# STEP 4: BUILD LLM PROMPT
-# --------------------------------------------------
-
-prompt = f"""
+def build_test_prompt(question: str, context: str) -> str:
+    return f"""
 You are a helpful assistant that answers questions about
 Royal Enfield motorcycles.
 
@@ -59,27 +42,63 @@ ANSWER:
 """
 
 
-# --------------------------------------------------
-# STEP 5: GENERATE FINAL ANSWER
-# --------------------------------------------------
+def answer_question(question: str):
+    original_question = question
+    normalized_question = normalize_question(original_question)
 
-answer = generate_answer(prompt)
+    print_debug("ORIGINAL QUESTION", original_question)
+    print_debug("NORMALIZED QUESTION", normalized_question)
+
+    # Reuse the existing query-aware RAG pipeline.
+    analysis = analyze_query(normalized_question)
+    print_debug("QUERY ANALYSIS", analysis)
+
+    results = retrieve(normalized_question)
+    print_debug("RETRIEVED RESULTS", results)
+
+    context = format_context(results)
+    print_debug("FORMATTED CONTEXT", context)
+
+    if not results:
+        print("No relevant context found in the document.")
+        return
+
+    prompt = build_test_prompt(original_question, context)
+    print_debug("LLM PROMPT", prompt)
+
+    try:
+        # Import here so a missing API key is reported without ending the
+        # interactive testing session.
+        from llm import generate_answer
+
+        answer = generate_answer(prompt)
+    except Exception as error:
+        print(f"\nUnable to generate an answer: {error}")
+        return
+
+    print(f"\n{answer}")
 
 
-# --------------------------------------------------
-# FINAL OUTPUT
-# --------------------------------------------------
+def main():
+    while True:
+        try:
+            question = input(
+                "\nEnter your question (or type 'exit' to quit):\n> "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nExiting RAG application test.")
+            break
 
-print()
-print("=" * 80)
-print("QUESTION")
-print("=" * 80)
-print(question)
+        if not question:
+            print("Please enter a question.")
+            continue
 
-print()
-print("=" * 80)
-print("FINAL ANSWER")
-print("=" * 80)
-print(answer)
+        if question.lower() in {"exit", "quit"}:
+            print("Exiting RAG application test.")
+            break
 
-print()
+        answer_question(question)
+
+
+if __name__ == "__main__":
+    main()
